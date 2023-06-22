@@ -1,0 +1,236 @@
+#This is a log, not a script
+#ZMT_oct292019_finished_nov7_2019
+
+#Working root directory:/psi/bassdata/zturpin/GumberKakuRNAseq
+#Raw data here: /psi/bassdata/GumberKakuRNA/Hank_Bass-08-16-2019_Bass_081819/Bass_081819/
+
+#Raw read quality control with fastqc
+raw=($(ls /psi/bassdata/GumberKakuRNA/Hank_Bass-08-16-2019_Bass_081819/Bass_081819/*))
+
+outroots=($(for a in ${raw[@]} ; do echo $a | awk '{ gsub(/.fastq.gz/,"") ; split($0,a,"/") ; print a[7]}'; done))
+
+mkdir preclip_fastqc
+
+#FastQC v0.11.8
+fastqc -q -o preclip_fastqc/ ${raw[@]} &
+
+#Inspect raw read quality here and identify 3' adapter sequence
+	#3' = Illumina Universal Adapter
+	#5´-AATGATACGGCGACCACCGAGATCTACACTCTTTCCCTACACGACGCTCTTCCGATCT-3´
+	#trim sequence (R1)=AGATCGGAAGAGCACACGTCTGAACTCCAGTCA
+#Trim raw reads (SE 100)
+#cutadapt version 1.16
+for (( b=0; b<${#raw[@]}; b++ ))
+do
+cutadapt -a AGATCGGAAGAGCACACGTCTGAACTCCAGTCA --quiet -o ${outroots[$b]}_trimmed.fastq.gz ${raw[$b]} &
+done
+
+#QC trimmed reads
+
+mkdir trimmed
+mv *gz trimmed/
+mkdir clip_fastqc
+fastqc -q -o clip_fastqc/ trimmed/*gz &
+
+
+#Align trimmed reads to genome using splice-aware aligner (Hisat2)
+	#Build hisat2 indices
+	#Convert GFF(3) from Carson Andorf to GTF
+gffread /psi/bassdata/zturpin/W22_genome/Zm00004b.gff -T -o Zm00004b.gtf
+	#extract splice sites from GTF file
+hisat2_extract_splice_sites.py /psi/bassdata/zturpin/W22_genome/Zm00004b.gtf >> Zm00004b_splicesites.txt
+	#extract exons from GTF file
+hisat2_extract_exons.py /psi/bassdata/zturpin/W22_genome/Zm00004b.gtf >> Zm00004b_exons.txt
+	
+	#hisat2-build [options]* <reference_in> <ht2_base>
+
+hisat2-build -p 8 --ss /psi/bassdata/zturpin/W22_genome/Zm00004b_splicesites.txt --exon /psi/bassdata/zturpin/W22_genome/Zm00004b_exons.txt -q -f /psi/bassdata/zturpin/W22_genome/Zm-W22-REFERENCE-NRGENE-2.0.fasta Zm-W22-REFERENCE-NRGENE-2.0 &
+
+#align reads to hisat2 index (built with known splice sites and exon coordinates from W22 genome annotation
+
+#loop through inputread files, novel splice outfile, and output rootnames.sam
+
+trimmed=($(ls /psi/bassdata/zturpin/GumberKakuRNAseq/trimmed/*))
+
+for (( b=0; b<${#trimmed[@]}; b++))
+do
+hisat2 -q --quiet --novel-splicesite-outfile ${outroots[$b]}_novelSpliceSites.txt --rna-strandness R --dta-cufflinks --summary-file ${outroots[$b]}_ht2_summary.txt -p 8 -x /psi/bassdata/zturpin/W22_genome/Zm-W22-REFERENCE-NRGENE-2.0 -U ${trimmed[$b]} -S ${outroots[$b]}_trimmed.sam &> ${outroots[$b]}_sterr.txt
+done &
+
+
+	#Assemble novel transcripts
+	# Stringtie2 | Cufflinks
+#coordinate sort samfile and convert to bam (keep alignments with MAPQ >= 20
+sams=($(ls *sam))
+for ((c=0; c<${#sams[@]}; c++))
+do
+samtools view -b -q 20 ${sams[$c]} | samtools sort -@ 4 -o ${outroots[$c]}_PosSorted.bam
+done
+
+#run in tmux session 1
+
+#Assemble transcripts for each sample
+bams=($(ls *bam))
+for ((d=0; d<${#bams[@]}; d++))
+do
+stringtie --conservative --rf -G /psi/bassdata/zturpin/W22_genome/Zm00004b.gtf -p 8 -o ${outroots[$d]}.gtf ${bams[$d]}
+done
+
+####
+
+#Merge transcripts to a non-redundant coverage-supported transcriptome
+transcripts=($(ls *001.gtf))
+stringtie --merge -G /psi/bassdata/zturpin/W22_genome/Zm00004b.gtf -o merged_transcripts.gtf ${transcripts[@]}
+
+#estimate transcript abundances and generate read coverage tables in ballgown format for each sample. 
+	#Note, you must specify individual directories for these files, as stringtie writes identical names
+mkdir ballgown
+for ((e=0; e<${#bams[@]}; e++))
+do
+mkdir ./ballgown/${outroots[$e]}
+stringtie --rf -p 8 -b ./ballgown/${outroots[$e]} -e -G merged_transcripts.gtf -o ./ballgown/${outroots[$e]}/${outroots[$e]}.gtf ${bams[$e]}
+done
+
+#cleanup working directory (consolidate bams, gtfs, etc)
+mkdir bams
+mkdir HS2_novelSpliceSites
+mkdir per_sample_transcripts
+
+mv *bam bams/
+mv *Sites.txt HS2_novelSpliceSites/
+mv *001.gtf per_sample_transcripts/
+
+#=====note: this script doesn't work, and authors are unresponsive to other users' questions
+	#make count matrices for DEseq2 using stringtie's prepDE.py script (note, directory structure must be ./ballgown/SampleID[@]/sampleID[@].gtf for default behavior. Otherwise, requires additional arguments (-i <path>)
+#=========	
+
+make tsv containing sample IDs and paths to .gtfs
+
+files=($(ls ballgown/*/*gtf))
+for ((f=0; f<${#outroots[@]}; f++))
+do
+echo ${outroots[$f]} ${files[$f]} >> sample_list.tmp
+done
+
+awk '{OFS="\t" ; print $0}' sample_list.tmp >> sample_list.txt
+rm sample_list.tmp
+
+#prepDE.py -i sample_list.txt
+
+#import data to R for DEseq2 differential expression analyses
+#tximport will compute counts from the coverage information, by reversing the formula that StringTie uses to calculate coverage
+
+#prepend t_data.ctab files with sampleIDs and cp to /psi/bassdata/zturpin/GumberKakuRNAseq/
+
+target=($(ls /psi/bassdata/zturpin/GumberKakuRNAseq/ballgown/*/t_data.ctab))
+
+new=($(for (( a=0; a<${#target[@]}; a++)) ; do echo ${target[$a]} | awk '{split($0,b,"/") ; print ".""/"b[7]"_t_data.ctab"}' ; done))
+
+
+for ((a=0; a<${#target[@]}; a++))
+do
+mv ${target[$a]} ${new[$a]}
+done
+
+#correct gene_name=. for all novel transcripts
+
+tables=($(ls *ctab))
+root=($( ls *ctab | awk '{gsub(/.ctab/,""); print $0}' ))
+
+
+for ((a=0; a<${#tables[@]}; a++))
+do
+awk '{ if($10==".") $10=$9 ; OFS="\t" ; print $0 }' ${tables[$a]} >>  ${root[$a]}_nameCorrect.ctab
+done
+
+
+
+
+
+
+
+R
+options(verbose=T)
+options(threads=8)
+library("tximport")
+library("readr")
+library("tximportData")
+library("DESeq2")
+library("travis")
+
+ctab=files("*.ctab")
+tmp <- read_tsv(ctab[1])
+tx2gene <- tmp[, c("t_name", "gene_name")]
+txi <- tximport(ctab, type = "stringtie", tx2gene = tx2gene)
+
+#make samples table
+Sample Tissue Condition Replicate
+1 Leaf WT 1
+2 Leaf WT 2
+3 Leaf WT 3
+4 Leaf Mut 1
+5 Leaf Mut 2
+6 Leaf Mut 3
+7 Tassel WT 1
+8 Tassel WT 2
+9 Tassel WT 3
+10 Tassel Mut 1
+11 Tassel Mut 2
+12 Tassel Mut 3
+
+samples <- read.table("Samples", header=TRUE)
+
+
+ddsTxi <- DESeqDataSetFromTximport(txi,
+                                   colData = samples,
+                                   design = (~ Tissue + Condition))
+
+#prefilter requiring >10 reads per transcript
+
+keep <- rowSums(counts(ddsTxi)) >= 10
+dds <- ddsTxi[keep,]
+
+#run DESeq
+
+dds <- DESeq(dds)
+
+#report ALL Mut vs WT
+mutWt <- results(dds, contrast=c("Condition","Mut","WT"))
+#write to tsv
+write.table(mutWt, file="mutVsWT.tsv", quote=FALSE, sep="\t")
+
+#extract combinations
+
+dds$group <- factor(paste0(dds$Condition, dds$Tissue))
+design(dds) <- ~ group
+dds <- DESeq(dds)
+resultsNames(dds)
+
+MutLeaf_vs_WtLeaf <- results(dds, contrast=c("group", "MutLeaf", "WTLeaf"))
+write.table(MutLeaf_vs_WtLeaf, file="mutVsWT_LEAF.tsv", quote=FALSE, sep="\t")
+
+
+MutTassel_vs_WtTassel <- results(dds, contrast=c("group", "MutTassel", "WTTassel"))
+write.table(MutTassel_vs_WtTassel, file="mutVsWT_Tassel.tsv", quote=FALSE, sep="\t")
+
+
+
+#Plot PCA of all samples
+#perform variance stabilizing transform
+vsd <- vst(dds, blind=FALSE)
+PCA <- plotPCA(vsd, intgroup=c("Tissue", "Condition")) 
+PCA
+
+#plot heatmap of sample to sample distances
+
+library("pheatmap")
+library("RColorBrewer")
+sampleDists <- dist(t(assay(vsd)))
+sampleDistanceMatrix <- as.matrix(sampleDists)
+rownames(sampleDistanceMatrix) <- paste(vsd$Condition, vsd$Tissue, sep="-")
+colnames(sampleDistanceMatrix) <- NULL
+colors <- colorRampPalette( rev(brewer.pal(9, "Blues")) )(255)
+pheatmap(sampleDistanceMatrix, clustering_distance_rows=sampleDists, clustering_distance_cols=sampleDists, col=colors)
+
+q()
+y
